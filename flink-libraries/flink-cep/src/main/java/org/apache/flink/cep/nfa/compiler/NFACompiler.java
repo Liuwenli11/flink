@@ -71,11 +71,13 @@ public class NFACompiler {
 		boolean timeoutHandling) {
 		if (pattern == null) {
 			// return a factory for empty NFAs
-			return new NFAFactoryImpl<>(0, Collections.<State<T>>emptyList(), timeoutHandling);
+			//return new NFAFactoryImpl<>(0, Collections.<State<T>>emptyList(), timeoutHandling);
+			return new NFAFactoryImpl<>(0, Collections.<State<T>>emptyList(), timeoutHandling, 0);
 		} else {
 			final NFAFactoryCompiler<T> nfaFactoryCompiler = new NFAFactoryCompiler<>(pattern);
 			nfaFactoryCompiler.compileFactory();
-			return new NFAFactoryImpl<>(nfaFactoryCompiler.getWindowTime(), nfaFactoryCompiler.getStates(), timeoutHandling);
+			//return new NFAFactoryImpl<>(nfaFactoryCompiler.getWindowTime(), nfaFactoryCompiler.getStates(), timeoutHandling);
+			return new NFAFactoryImpl<>(nfaFactoryCompiler.getWindowTime(), nfaFactoryCompiler.getStates(), timeoutHandling, nfaFactoryCompiler.getWaitingTime());
 		}
 	}
 
@@ -130,6 +132,7 @@ public class NFACompiler {
 		private final List<State<T>> states = new ArrayList<>();
 
 		private long windowTime = 0;
+		private long waitingTime = 0;
 		private GroupPattern<T, ?> currentGroupPattern;
 		private Map<GroupPattern<T, ?>, Boolean> firstOfLoopMap = new HashMap<>();
 		private Pattern<T, ?> currentPattern;
@@ -173,6 +176,11 @@ public class NFACompiler {
 
 		long getWindowTime() {
 			return windowTime;
+		}
+
+		long getWaitingTime() {
+			return waitingTime;
+
 		}
 
 		/**
@@ -266,6 +274,7 @@ public class NFACompiler {
 		private State<T> createEndingState() {
 			State<T> endState = createState(ENDING_STATE_NAME, State.StateType.Final);
 			windowTime = currentPattern.getWindowTime() != null ? currentPattern.getWindowTime().toMilliseconds() : 0L;
+			waitingTime = currentPattern.getWaitingTime() != null ? currentPattern.getWaitingTime().toMilliseconds() : 0L;
 			return endState;
 		}
 
@@ -294,6 +303,15 @@ public class NFACompiler {
 					}
 					notNext.addProceed(stopState, notCondition);
 					lastSink = notNext;
+				}
+				// add wait state
+				else if (currentPattern.getQuantifier().getConsumingStrategy() == Quantifier.ConsumingStrategy.WAITING) {
+					final State<T> waitingState = createWaitingState(currentPattern.getName());
+					final IterativeCondition<T> waitingCondition = getTakeCondition(currentPattern);
+
+					waitingState.addIgnore(waitingCondition);
+					lastSink = waitingState;
+					addStopStates(lastSink);
 				} else {
 					lastSink = convertPattern(lastSink);
 				}
@@ -309,6 +327,13 @@ public class NFACompiler {
 				}
 			}
 			return lastSink;
+		}
+
+		public State<T> createWaitingState(String name) {
+			String stateName = stateNameHandler.getUniqueInternalName(name);
+			State<T> state = new State<>(stateName, State.StateType.Waiting);
+			states.add(state);
+			return state;
 		}
 
 		/**
@@ -926,19 +951,23 @@ public class NFACompiler {
 		private final Collection<State<T>> states;
 		private final boolean timeoutHandling;
 
+		private final long waitingTime;
 		private NFAFactoryImpl(
 				long windowTime,
 				Collection<State<T>> states,
-				boolean timeoutHandling) {
+				boolean timeoutHandling,
+				long waitingTime) {
 
 			this.windowTime = windowTime;
 			this.states = states;
 			this.timeoutHandling = timeoutHandling;
+			this.waitingTime = waitingTime;
 		}
 
 		@Override
 		public NFA<T> createNFA() {
-			return new NFA<>(states, windowTime, timeoutHandling);
+			//return new NFA<>(states, windowTime, timeoutHandling);
+			return new NFA<>(states, windowTime, waitingTime, timeoutHandling);
 		}
 	}
 }

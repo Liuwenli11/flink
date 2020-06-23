@@ -446,6 +446,27 @@ class Pattern[T , F <: T](jPattern: JPattern[T, F]) {
   }
 
   /**
+    * follow the wait pattern, set the waiting time
+    *
+    * @param waitingTime Time of the matching window
+    * @return The same pattern operator with the new window length
+    */
+  def waitting(waitingTime: Time): Pattern[T, F] = {
+    jPattern.waitting(waitingTime)
+    this
+  }
+
+  /**
+    * Match with notFollowedBy,if notFollowedBy has not occurred within the waitting time, trigger wait
+    *
+    * @param name Name of the new pattern
+    * @return A new pattern which is appended to this one
+    */
+  def wait(name: String): Pattern[T, T] = {
+    Pattern[T, T](jPattern.wait(name))
+  }
+
+  /**
     * Appends a new group pattern to the existing one. The new pattern enforces non-strict
     * temporal contiguity. This means that a matching event of this pattern and the
     * preceding matching event might be interleaved with other events which are ignored.

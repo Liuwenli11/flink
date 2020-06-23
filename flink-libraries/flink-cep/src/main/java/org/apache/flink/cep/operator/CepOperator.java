@@ -28,10 +28,12 @@ import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.ListSerializer;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
+import org.apache.flink.api.common.typeutils.base.VoidSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.cep.EventComparator;
 import org.apache.flink.cep.functions.PatternProcessFunction;
 import org.apache.flink.cep.functions.TimedOutPartialMatchHandler;
+import org.apache.flink.cep.nfa.ComputationState;
 import org.apache.flink.cep.nfa.NFA;
 import org.apache.flink.cep.nfa.NFA.MigratedNFA;
 import org.apache.flink.cep.nfa.NFAState;
@@ -62,11 +64,7 @@ import org.apache.flink.util.Preconditions;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.PriorityQueue;
+import java.util.*;
 import java.util.stream.Stream;
 
 /**
@@ -93,12 +91,14 @@ public class CepOperator<IN, KEY, OUT>
 
 	private static final String NFA_STATE_NAME = "nfaStateName";
 	private static final String EVENT_QUEUE_STATE_NAME = "eventQueuesStateName";
+	private static final String WAIT_STAMP_STATE_NAME = "waitStampStateName";
 
 	private final NFACompiler.NFAFactory<IN> nfaFactory;
 
 	private transient ValueState<NFAState> computationStates;
 	private transient MapState<Long, List<IN>> elementQueueState;
 	private transient SharedBuffer<IN> partialMatches;
+	private transient MapState<Long,Void> waitStampState;
 
 	private transient InternalTimerService<VoidNamespace> timerService;
 
@@ -182,6 +182,9 @@ public class CepOperator<IN, KEY, OUT>
 						EVENT_QUEUE_STATE_NAME,
 						LongSerializer.INSTANCE,
 						new ListSerializer<>(inputSerializer)));
+		waitStampState = context.getKeyedStateStore().getMapState(
+			new MapStateDescriptor<Long,Void>(WAIT_STAMP_STATE_NAME,
+				LongSerializer.INSTANCE, VoidSerializer.INSTANCE));
 
 		migrateOldState();
 	}
@@ -234,7 +237,12 @@ public class CepOperator<IN, KEY, OUT>
 	@Override
 	public void processElement(StreamRecord<IN> element) throws Exception {
 		if (isProcessingTime) {
-			if (comparator == null) {
+			// add waiting time process
+			if (nfa.waitingTime > 0) {
+				long currentTime = timerService.currentProcessingTime();
+				bufferEvent(element.getValue(), currentTime);
+				timerService.registerProcessingTimeTimer(VoidNamespace.INSTANCE, currentTime + 1);
+			} else if (comparator == null) {
 				// there can be no out of order elements in processing time
 				NFAState nfaState = getNFAState();
 				long timestamp = getProcessingTimeService().getCurrentProcessingTime();
@@ -287,7 +295,7 @@ public class CepOperator<IN, KEY, OUT>
 	}
 
 	private void bufferEvent(IN event, long currentTime) throws Exception {
-		List<IN> elementsForTimestamp =  elementQueueState.get(currentTime);
+		List<IN> elementsForTimestamp = elementQueueState.get(currentTime);
 		if (elementsForTimestamp == null) {
 			elementsForTimestamp = new ArrayList<>();
 		}
@@ -311,6 +319,21 @@ public class CepOperator<IN, KEY, OUT>
 		PriorityQueue<Long> sortedTimestamps = getSortedTimestamps();
 		NFAState nfaState = getNFAState();
 
+		// if nfaState has waiting state then process ...
+		long currentTime = timerService.currentWatermark();
+
+		if (nfa.waitingTime > 0) {
+			if (hasWaitState(nfaState)) {
+				processEvent(nfaState, null, currentTime);
+			}
+			waitStampState.clear();
+			for (ComputationState state : nfaState.getPartialMatches()) {
+				if (nfa.isWaitingState(state)) {
+					waitStampState.put(state.getStartTimestamp(), null);
+				}
+			}
+		}
+
 		// STEP 2
 		while (!sortedTimestamps.isEmpty() && sortedTimestamps.peek() <= timerService.currentWatermark()) {
 			long timestamp = sortedTimestamps.poll();
@@ -320,6 +343,14 @@ public class CepOperator<IN, KEY, OUT>
 					event -> {
 						try {
 							processEvent(nfaState, event, timestamp);
+							if (nfa.waitingTime > 0){
+								for (ComputationState state : nfaState.getPartialMatches()) {
+									if (nfa.isWaitingState(state) && !containState(state)) {
+										waitStampState.put(state.getStartTimestamp(),null);
+										timerService.registerEventTimeTimer(VoidNamespace.INSTANCE, currentTime + nfa.waitingTime + 100);
+									}
+								}
+							}
 						} catch (Exception e) {
 							throw new RuntimeException(e);
 						}
@@ -353,17 +384,42 @@ public class CepOperator<IN, KEY, OUT>
 
 		// STEP 1
 		PriorityQueue<Long> sortedTimestamps = getSortedTimestamps();
-		NFAState nfa = getNFAState();
+		//NFAState nfa = getNFAState();
+		NFAState nfaState = getNFAState();
+		// if nfaState has waiting state then process ...
+		long currentTime = timerService.currentProcessingTime();
+
+		if (nfa.waitingTime > 0) {
+			if (hasWaitState(nfaState)) {
+				processEvent(nfaState, null, currentTime);
+			}
+			waitStampState.clear();
+			for (ComputationState state : nfaState.getPartialMatches()) {
+				if (nfa.isWaitingState(state)) {
+					waitStampState.put(state.getStartTimestamp(), null);
+				}
+			}
+		}
 
 		// STEP 2
 		while (!sortedTimestamps.isEmpty()) {
 			long timestamp = sortedTimestamps.poll();
-			advanceTime(nfa, timestamp);
+			//advanceTime(nfa, timestamp);
+			advanceTime(nfaState, timestamp);
 			try (Stream<IN> elements = sort(elementQueueState.get(timestamp))) {
 				elements.forEachOrdered(
 					event -> {
 						try {
-							processEvent(nfa, event, timestamp);
+							//processEvent(nfa, event, timestamp);
+							processEvent(nfaState, event, timestamp);
+							if (nfa.waitingTime > 0) {
+								for (ComputationState state : nfaState.getPartialMatches()) {
+									if (nfa.isWaitingState(state) && !containState(state)) {
+										waitStampState.put(state.getStartTimestamp(), null);
+										timerService.registerProcessingTimeTimer(VoidNamespace.INSTANCE, currentTime + nfa.waitingTime + 1);
+									}
+								}
+							}
 						} catch (Exception e) {
 							throw new RuntimeException(e);
 						}
@@ -374,12 +430,37 @@ public class CepOperator<IN, KEY, OUT>
 		}
 
 		// STEP 3
-		updateNFA(nfa);
+		//updateNFA(nfa);
+		updateNFA(nfaState);
+	}
+
+	private boolean containState(ComputationState state) {
+		try {
+			Iterator<Long> timeStamps = waitStampState.keys().iterator();
+			while (timeStamps.hasNext()) {
+				if (timeStamps.next() == state.getStartTimestamp()) {
+					return true;
+				}
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+
+		}
+		return false;
 	}
 
 	private Stream<IN> sort(Collection<IN> elements) {
 		Stream<IN> stream = elements.stream();
 		return (comparator == null) ? stream : stream.sorted(comparator);
+	}
+
+	public boolean hasWaitState(NFAState nfaState) {
+		for (ComputationState state : nfaState.getPartialMatches()) {
+			if (nfa.isWaitingState(state)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private void updateLastSeenWatermark(long timestamp) {
